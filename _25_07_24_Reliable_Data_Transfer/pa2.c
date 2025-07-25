@@ -54,11 +54,17 @@ int num_requests = 1000000;
  * This structure is used to store per-thread data in the client
  */
 typedef struct {
+    // original
     int epoll_fd;        /* File descriptor for the epoll instance, used for monitoring events on the socket. */
     int socket_fd;       /* File descriptor for the client socket connected to the server. */
     long long total_rtt; /* Accumulated Round-Trip Time (RTT) for all messages sent and received (in microseconds). */
     long total_messages; /* Total number of messages sent and received. */
     float request_rate;  /* Computed request rate (requests per second) based on RTT and total messages. */
+
+    // for packet loss measurement
+    long tx_cnt;  // number of packets sent by each client thread
+    long rx_cnt;  // number of returned packets successfully received by the client thread
+    long lost_pkt_cnt;
 } client_thread_data_t;
 
 /*
@@ -95,13 +101,15 @@ void *client_thread_func(void *arg) {
             perror("send");
             break;
         }
+        data->tx_cnt++;
 
         // after wait, have [nfds] events ready
-        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, -1);  // until readable
+        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100);  //? this timeout parameter
         if (nfds == -1) {
             perror("epoll_wait");
             break;
         }
+        if (nfds == 0) { continue; }  // timeout and packet lost
 
         // handle each of them
         for (int j = 0; j < nfds; j++) {
@@ -112,6 +120,7 @@ void *client_thread_func(void *arg) {
                 perror("recv");
                 break;
             }
+            data->rx_cnt++;  // packet received successfully
 
             gettimeofday(&end, NULL);
             long long rtt = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
@@ -127,6 +136,7 @@ void *client_thread_func(void *arg) {
     if (data->total_rtt > 0) {
         data->request_rate = (float)data->total_messages / (data->total_rtt / 1000000.0f);
     }
+    data->lost_pkt_cnt = data->tx_cnt - data->rx_cnt;
 
     close(data->socket_fd);
     close(data->epoll_fd);
@@ -164,7 +174,7 @@ void run_client() {
             exit(EXIT_FAILURE);
         }
 
-        // keep the connect to keep using send & recv
+        // we can keep the connect() to keep using send & recv in client
         if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
             perror("connect");
             exit(EXIT_FAILURE);
@@ -183,7 +193,9 @@ void run_client() {
             .socket_fd = sock,
             .total_rtt = 0,
             .total_messages = 0,
-            .request_rate = 0.0f
+            .request_rate = 0.0f,
+            .tx_cnt = 0,
+            .rx_cnt = 0
         };
 
         // create thread with thread_data
@@ -196,16 +208,19 @@ void run_client() {
     long long total_rtt = 0;
     long total_messages = 0;
     float total_request_rate = 0.0f;
+    long total_lost_pkts = 0;
 
     for (int i = 0; i < num_client_threads; i++) {
         pthread_join(threads[i], NULL);
         total_rtt += thread_data[i].total_rtt;
         total_messages += thread_data[i].total_messages;
         total_request_rate += thread_data[i].request_rate;
+        total_lost_pkts += thread_data[i].lost_pkt_cnt;
     }
 
     printf("Average RTT: %lld us\n", total_rtt / total_messages);
     printf("Total Request Rate: %f messages/s\n", total_request_rate);
+    printf("Total Packet Loss: %ld messages\n", total_lost_pkts);
 }
 
 void run_server() {

@@ -27,6 +27,7 @@ Please specify the group members here
 
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
+#include <asm-generic/socket.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,7 +116,7 @@ void *client_thread_func(void *arg) {
         for (int j = 0; j < nfds; j++) {
             if (events[j].data.fd != data->socket_fd) continue;  // retreive that data and identify
 
-            ssize_t bytes = recv(data->socket_fd, recv_buf, MESSAGE_SIZE, MSG_WAITALL);
+            ssize_t bytes = recv(data->socket_fd, recv_buf, MESSAGE_SIZE, MSG_WAITALL);  // WAITALL no need for udp?
             if (bytes != MESSAGE_SIZE) {
                 perror("recv");
                 break;
@@ -236,6 +237,13 @@ void run_server() {
     sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (sock == -1) {
         perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // reduce socket buffer, might help observing packet loss
+    int rcv_buf_size = 2048;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size)) == -1) {
+        perror("setsockopt");
         exit(EXIT_FAILURE);
     }
 

@@ -27,9 +27,11 @@ Please specify the group members here
 
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
@@ -141,10 +143,11 @@ void run_client() {
     client_thread_data_t thread_data[num_client_threads];
     struct sockaddr_in server_addr;
 
-    memset(&server_addr, 0, sizeof(server_addr));
+    // set server address
+    memset(&server_addr, 0, sizeof(server_addr));  // init memory
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);  // host to network short
-    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);  // presentation to network
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);  // ip presentation to network
 
     /* TODO:
      * Create sockets and epoll instances for client threads
@@ -155,12 +158,13 @@ void run_client() {
     // You will pass the thread_data to pthread_create() as below
     for (int i = 0; i < num_client_threads; i++) {
         // create socket instance
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock == -1) {
             perror("socket");
             exit(EXIT_FAILURE);
         }
 
+        // keep the connect to keep using send & recv
         if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
             perror("connect");
             exit(EXIT_FAILURE);
@@ -214,7 +218,7 @@ void run_server() {
      * Server creates listening socket and epoll instance.
      * Server registers the listening socket to epoll
      */
-    sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (sock == -1) {
         perror("socket");
         exit(EXIT_FAILURE);
@@ -225,7 +229,7 @@ void run_server() {
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;  // all interfaces
+    server_addr.sin_addr.s_addr = INADDR_ANY;  // server listens to all interfaces for that port number
     server_addr.sin_port = htons(server_port);
 
     if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1) {
@@ -233,10 +237,11 @@ void run_server() {
         exit(EXIT_FAILURE);
     }
 
-    if (listen(sock, 3) == -1) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
+    // No use for udp
+    // if (listen(sock, 3) == -1) {
+    //     perror("listen");
+    //     exit(EXIT_FAILURE);
+    // }
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
@@ -268,61 +273,14 @@ void run_server() {
             int fd = events[i].data.fd;
             uint32_t mask = events[i].events;
 
-            if (fd == sock) {  // new connection
-                while (1) {
-                    struct sockaddr_in client_addr;
-                    socklen_t len = sizeof(client_addr);
+            // new data sent, read and send back
+            if (mask & EPOLLIN) {
+                struct sockaddr_in client_addr;
+                socklen_t len = sizeof(client_addr);
+                ssize_t n = recvfrom(fd, buf, MESSAGE_SIZE, 0, (struct sockaddr*)&client_addr, &len);
 
-                    int client_fd = accept(sock, (struct sockaddr *)&client_addr, &len);
-                    if (client_fd == -1) {
-                        if (errno == EAGAIN) break;  // queue's empty
-                        perror("accept");
-                        break;
-                    }
-
-                    // set non-block
-                    int flags = fcntl(client_fd, F_GETFL, 0);
-                    fcntl(client_fd, F_SETFL, flags  | O_NONBLOCK);
-                    fcntl(client_fd, F_SETFD, FD_CLOEXEC);
-
-                    event.events = EPOLLIN | EPOLLRDHUP;
-                    event.data.fd = client_fd;
-                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &event) == -1) {
-                        perror("epoll_ctl");
-                        close(client_fd);
-                    }
-                }
-            }
-            else {
-                if (mask & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)) {
-                    close(fd);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                    continue;
-                }
-
-                if (mask & EPOLLIN) {
-                    ssize_t rbytes = recv(fd, buf, MESSAGE_SIZE, MSG_WAITALL);
-                    if (rbytes <= 0) {
-                        if (rbytes == 0 || errno == ECONNRESET) {
-                            close(fd);
-                            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-                        }
-                        else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                            perror("recv");
-                        }
-                        continue;
-                    }
-
-                    ssize_t sbytes = 0;
-                    while (sbytes < rbytes) {
-                        ssize_t n = send(fd, buf + sbytes, rbytes - sbytes, 0);
-                        if (n == -1) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                            perror("send");
-                            break;
-                        }
-                        sbytes += n;
-                    }
+                if (n > 0) {
+                    sendto(fd, buf, n, 0, (struct sockaddr*)&client_addr, len);
                 }
             }
         }

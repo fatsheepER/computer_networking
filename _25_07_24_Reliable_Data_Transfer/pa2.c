@@ -29,6 +29,7 @@ Please specify the group members here
 #include <asm-generic/errno.h>
 #include <asm-generic/socket.h>
 #include <netinet/in.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,26 @@ typedef struct {
     long lost_pkt_cnt;
 } client_thread_data_t;
 
+typedef struct {
+    uint32_t client_id;  // id for specific client
+    uint16_t seq;  // sequence number
+    uint16_t ack;  // acknowlegement number
+    uint8_t flags;  // 0: ack; 1: data
+    uint8_t wnd_size;  // sender's avaliable window size
+    uint16_t len;  // length of payload, always 16 here
+    uint32_t checksum;  // crc-32c
+} header_t;
+
+typedef struct {
+    header_t header;
+    char payload[MESSAGE_SIZE];
+} frame_t;
+
+#define HEADER_SIZE sizeof(frame_header_t)
+#define FRAME_SIZE (HEADER_SIZE + MESSAGE_SIZE)
+#define WND_SIZE 64  
+#define MAX_SEQ 256  // enough for current window size
+
 /*
  * This function runs in a separate client thread to handle communication with the server
  */
@@ -105,7 +126,7 @@ void *client_thread_func(void *arg) {
         data->tx_cnt++;
 
         // after wait, have [nfds] events ready
-        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 100);  //? this timeout parameter
+        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20);  //? this timeout parameter
         if (nfds == -1) {
             perror("epoll_wait");
             break;

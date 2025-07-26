@@ -42,6 +42,7 @@ Please specify the group members here
 #include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
+#include "crc32c.h"
 
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
@@ -67,6 +68,9 @@ typedef struct {
     long tx_cnt;  // number of packets sent by each client thread
     long rx_cnt;  // number of returned packets successfully received by the client thread
     long lost_pkt_cnt;
+
+    // for rdt
+    uint32_t client_id;
 } client_thread_data_t;
 
 typedef struct {
@@ -84,10 +88,33 @@ typedef struct {
     char payload[MESSAGE_SIZE];
 } frame_t;
 
-#define HEADER_SIZE sizeof(frame_header_t)
+#define HEADER_SIZE sizeof(header_t)
 #define FRAME_SIZE (HEADER_SIZE + MESSAGE_SIZE)
 #define WND_SIZE 64  
 #define MAX_SEQ 256  // enough for current window size
+
+frame_t make_data_frame(int seq, uint32_t client_id) {
+    frame_t frame;
+
+    // set header
+    frame.header.client_id = client_id;
+    frame.header.seq = seq;
+    frame.header.ack = 0;  // it's not an ack frame
+    frame.header.flags = 1;
+    frame.header.wnd_size = WND_SIZE;
+    frame.header.len = MESSAGE_SIZE;
+
+    // set payload
+    memcpy(frame.payload, "ABCDEFGHIJKLMNOP", 16);
+
+    // calculate checksum
+    char buffer[FRAME_SIZE];
+    memcpy(buffer, &frame.header, HEADER_SIZE);
+    memcpy(buffer + HEADER_SIZE, frame.payload, MESSAGE_SIZE);
+    frame.header.checksum = crc32c(buffer, FRAME_SIZE);
+
+    return frame;
+}
 
 /*
  * This function runs in a separate client thread to handle communication with the server
@@ -113,6 +140,18 @@ void *client_thread_func(void *arg) {
     if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) == -1) {
         perror("epoll_ctl");
         pthread_exit(NULL);
+    }
+
+    uint32_t client_id = data->client_id;
+    int total_sent = 0;
+    int base = 0;  // the first sent-and-unacked seq
+    int next_seq = 0;  // next seq to send
+
+    while (total_sent < num_requests) {
+        // fill the window
+        while (next_seq < base + WND_SIZE && total_sent < num_requests) {
+            frame_t f = make_data_frame(next_seq, client_id);
+        }
     }
  
     for (int i = 0; i < num_requests; i++) {
@@ -181,6 +220,9 @@ void run_client() {
     server_addr.sin_port = htons(server_port);  // host to network short
     inet_pton(AF_INET, server_ip, &server_addr.sin_addr);  // ip presentation to network
 
+    // init crc32c table
+    crc32c_init();
+
     /* TODO:
      * Create sockets and epoll instances for client threads
      * and connect these sockets of client threads to the server
@@ -217,7 +259,8 @@ void run_client() {
             .total_messages = 0,
             .request_rate = 0.0f,
             .tx_cnt = 0,
-            .rx_cnt = 0
+            .rx_cnt = 0,
+            .client_id = (uint32_t)i  // allocate id for each client
         };
 
         // create thread with thread_data

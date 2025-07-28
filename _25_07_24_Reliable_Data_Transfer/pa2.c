@@ -48,6 +48,7 @@ Please specify the group members here
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
 #define DEFAULT_CLIENT_THREADS 4
+#define MAX_CLIENT_THREADS 10000
 
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
@@ -77,8 +78,8 @@ typedef struct {
 // Structure of a frame header
 typedef struct {
     uint32_t client_id;  // id for specific client
-    uint16_t seq;  // sequence number
-    uint16_t ack;  // acknowlegement number
+    uint16_t seq;  // sequence number (or acknowlegement number for ack frame)
+    uint16_t ack;  // why did I put it here, unavail
     uint8_t flags;  // 0: ack; 1: data
     uint8_t wnd_size;  // sender's avaliable window size
     uint16_t len;  // length of payload, always 16 here
@@ -97,7 +98,7 @@ typedef struct {
 #define MAX_SEQ 256  // enough for current window size
 #define TIMEOUT_US 20000LL  // 20 ms
 
-frame_t make_data_frame(int seq, uint32_t client_id) {
+frame_t make_data_frame(uint16_t seq, uint32_t client_id) {
     frame_t frame;
 
     // set header
@@ -113,10 +114,8 @@ frame_t make_data_frame(int seq, uint32_t client_id) {
 
     // calculate checksum
     frame.header.checksum = 0;  // do the same in verification
-    char buffer[FRAME_SIZE];
-    memcpy(buffer, &frame.header, HEADER_SIZE);
-    memcpy(buffer + HEADER_SIZE, frame.payload, MESSAGE_SIZE);
-    frame.header.checksum = htonl(crc32c(buffer, FRAME_SIZE));
+    uint32_t cksum = crc32c((char *)&frame, FRAME_SIZE);
+    frame.header.checksum = htonl(cksum);
 
     return frame;
 }
@@ -189,8 +188,8 @@ void *client_thread_func(void *arg) {
     }
 
     int total_sent = 0;  //! can be replaced by tx_cnt
-    int base = 0;  // the first sent-and-unacked seq
-    int next_seq = 0;  // next seq to send
+    uint16_t base = 0;  // the first sent-and-unacked seq
+    uint16_t next_seq = 0;  // next seq to send
     frame_t send_buf[WND_SIZE];
     long long time_start_us = -1;  // -1: not started yet
 
@@ -219,6 +218,12 @@ void *client_thread_func(void *arg) {
 
         // Timeout: retransmit all within window
         if (nfds == 0) {
+            // can never be too careful
+            if (base == next_seq) {
+                time_start_us = -1;
+                continue;
+            }
+
             int num_resent = retransmit_window(data->socket_fd, send_buf, base, next_seq);
             // as asked to, no need to update tx_cnt after retransmission. anyway, it's accessible if needed
             start_timer(&time_start_us);
@@ -231,7 +236,7 @@ void *client_thread_func(void *arg) {
 
             // is it complete
             frame_t ack_frame;
-            ssize_t rbytes = recv(data->socket_fd, &ack_frame, FRAME_SIZE, MSG_WAITALL);
+            ssize_t rbytes = recv(data->socket_fd, &ack_frame, FRAME_SIZE, 0);
             if (rbytes != FRAME_SIZE) { perror("recv"); break; }
 
             // is it an ack
@@ -241,10 +246,8 @@ void *client_thread_func(void *arg) {
             uint32_t cs_original = ntohl(ack_frame.header.checksum);
             ack_frame.header.checksum = 0;
             char check_buf[FRAME_SIZE];
-            memcpy(check_buf, &ack_frame.header, HEADER_SIZE);
-            memcpy(check_buf + HEADER_SIZE, ack_frame.payload, MESSAGE_SIZE);
 
-            uint32_t cs_result = crc32c(check_buf, FRAME_SIZE);
+            uint32_t cs_result = crc32c((char *)&ack_frame, FRAME_SIZE);
             if (cs_result != cs_original) { 
                 fprintf(stderr, "checksum mismatch!\n");
                 continue;
@@ -287,9 +290,6 @@ void run_client() {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);  // host to network short
     inet_pton(AF_INET, server_ip, &server_addr.sin_addr);  // ip presentation to network
-
-    // init crc32c table
-    crc32c_init();
 
     /* TODO:
      * Create sockets and epoll instances for client threads
@@ -338,29 +338,69 @@ void run_client() {
     /* TODO:
      * Wait for client threads to complete and aggregate metrics of all client threads
      */
-    long long total_rtt = 0;
-    long total_messages = 0;
-    float total_request_rate = 0.0f;
+    long total_tx_cnt = 0;
+    long total_rx_cnt = 0;
     long total_lost_pkts = 0;
 
     for (int i = 0; i < num_client_threads; i++) {
         pthread_join(threads[i], NULL);
-        total_rtt += thread_data[i].total_rtt;
-        total_messages += thread_data[i].total_messages;
-        total_request_rate += thread_data[i].request_rate;
+        total_tx_cnt += thread_data[i].tx_cnt;
+        total_rx_cnt += thread_data[i].rx_cnt;
         total_lost_pkts += thread_data[i].lost_pkt_cnt;
     }
 
-    printf("Average RTT: %lld us\n", total_rtt / total_messages);
-    printf("Total Request Rate: %f messages/s\n", total_request_rate);
+    printf("Total tx_cnt: %ld messages\n", total_tx_cnt);
+    printf("Total rx_cnt: %ld messages\n", total_rx_cnt);
     printf("Total Packet Loss: %ld messages\n", total_lost_pkts);
+}
+
+typedef struct {
+    uint16_t expect_seq;  // should start from 0
+    uint16_t last_ack;  // init as MAX_SEQ - 1
+} client_state_t;
+
+client_state_t c_states[MAX_CLIENT_THREADS];
+char c_visited[MAX_CLIENT_THREADS];  // is it a bad name?
+
+client_state_t *lookup_state(uint32_t client_id) {
+    if (client_id < 0 || client_id >= MAX_CLIENT_THREADS) {
+        fprintf(stderr, "Invalid client id to lookup.\n");
+        return NULL;
+    }
+
+    // establish connection
+    if (!c_visited[client_id]) {
+        c_states[client_id].expect_seq = 0;
+        c_states[client_id].last_ack = MAX_SEQ - 1;
+        c_visited[client_id] = 1;
+    }
+
+    return &c_states[client_id];
+}
+
+frame_t make_ack_frame(uint16_t seq, uint32_t client_id) {
+    frame_t frame;
+
+    frame.header.client_id = htonl(client_id);
+    frame.header.seq = htons(seq);
+    frame.header.ack = 0;
+    frame.header.flags = 0;
+    frame.header.wnd_size = WND_SIZE;
+    frame.header.len = htons(MESSAGE_SIZE);
+
+    memset(frame.payload, 0, MESSAGE_SIZE);
+
+    frame.header.checksum = 0;
+    uint32_t cksum = crc32c((char *)&frame, FRAME_SIZE);
+    frame.header.checksum = htonl(cksum);
+
+    return frame;
 }
 
 void run_server() {
     int sock, epfd;
     struct sockaddr_in server_addr;
     struct epoll_event event, events[MAX_EVENTS];
-    char buf[MESSAGE_SIZE];
 
     /* TODO:
      * Server creates listening socket and epoll instance.
@@ -392,12 +432,6 @@ void run_server() {
         exit(EXIT_FAILURE);
     }
 
-    // No use for udp
-    // if (listen(sock, 3) == -1) {
-    //     perror("listen");
-    //     exit(EXIT_FAILURE);
-    // }
-
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1) {
         perror("epoll_create");
@@ -411,11 +445,17 @@ void run_server() {
         exit(EXIT_FAILURE);
     }
 
+    crc32c_init(); // init crc32c table
+
+    frame_t rcv_frame;
+
     /* Server's run-to-completion event loop */
     while (1) {
         /* TODO:
          * Server uses epoll to handle connection establishment with clients
          * or receive the message from clients and echo the message back
+         * Since my protocal has no handshaking stuff, client should always
+         * start with seq number 0 to establish the connection
          */
         int nfds = epoll_wait(epfd, events, MAX_EVENTS, -1);
         if (nfds == -1) {
@@ -432,10 +472,44 @@ void run_server() {
             if (mask & EPOLLIN) {
                 struct sockaddr_in client_addr;
                 socklen_t len = sizeof(client_addr);
-                ssize_t n = recvfrom(fd, buf, MESSAGE_SIZE, 0, (struct sockaddr*)&client_addr, &len);
+                ssize_t rbytes = recvfrom(fd, &rcv_frame, FRAME_SIZE, 0, (struct sockaddr*)&client_addr, &len);
+                
+                if (rbytes != FRAME_SIZE) {
+                    perror("recvfrom");
+                    continue;
+                }
 
-                if (n > 0) {
-                    sendto(fd, buf, n, 0, (struct sockaddr*)&client_addr, len);
+                // checksum
+                uint32_t cs_original = ntohl(rcv_frame.header.checksum);
+                rcv_frame.header.checksum = 0;
+                uint32_t cs_result = crc32c((char *)&rcv_frame, FRAME_SIZE);
+                if (cs_result != cs_original) {
+                    fprintf(stderr, "Checksum error.\n");
+                    continue;
+                }
+
+                // is data
+                if (rcv_frame.header.flags != 1) {
+                    continue;
+                }
+
+                uint32_t client_id = ntohl(rcv_frame.header.client_id);
+                uint16_t seq = ntohs(rcv_frame.header.seq);
+                client_state_t *state = lookup_state(client_id);
+                if (!state) continue;
+
+                // update ack and e_seq if pass the gbn check
+                if (seq == state->expect_seq) {
+                    state->last_ack = seq;
+                    state->expect_seq = (seq + 1) % MAX_SEQ;
+                }
+
+                // send ack
+                frame_t ack_frame = make_ack_frame(state->last_ack, client_id);
+                ssize_t sbytes = sendto(fd, &ack_frame, FRAME_SIZE, 0, (struct sockaddr *)&client_addr, len);
+                if (sbytes != FRAME_SIZE) {
+                    perror("sendto");
+                    continue;
                 }
             }
         }
@@ -456,6 +530,11 @@ int main(int argc, char *argv[]) {
         if (argc > 3) server_port = atoi(argv[3]);
         if (argc > 4) num_client_threads = atoi(argv[4]);
         if (argc > 5) num_requests = atoi(argv[5]);
+
+        if (num_client_threads >= MAX_CLIENT_THREADS) {
+            fprintf(stderr, "Number of clients exceeds the maximum of %d.", MAX_CLIENT_THREADS);
+            return 0;
+        }
 
         run_client();
     } else {

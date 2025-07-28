@@ -101,12 +101,12 @@ frame_t make_data_frame(int seq, uint32_t client_id) {
     frame_t frame;
 
     // set header
-    frame.header.client_id = client_id;
-    frame.header.seq = seq;
+    frame.header.client_id = htonl(client_id);
+    frame.header.seq = htons(seq);
     frame.header.ack = 0;  // it's not an ack frame
     frame.header.flags = 1;
     frame.header.wnd_size = WND_SIZE;
-    frame.header.len = MESSAGE_SIZE;
+    frame.header.len = htons(MESSAGE_SIZE);
 
     // set payload
     memcpy(frame.payload, "ABCDEFGHIJKLMNOP", 16);
@@ -116,7 +116,7 @@ frame_t make_data_frame(int seq, uint32_t client_id) {
     char buffer[FRAME_SIZE];
     memcpy(buffer, &frame.header, HEADER_SIZE);
     memcpy(buffer + HEADER_SIZE, frame.payload, MESSAGE_SIZE);
-    frame.header.checksum = crc32c(buffer, FRAME_SIZE);
+    frame.header.checksum = htonl(crc32c(buffer, FRAME_SIZE));
 
     return frame;
 }
@@ -238,7 +238,7 @@ void *client_thread_func(void *arg) {
             if (ack_frame.header.flags != 0) continue;
 
             // check checksum
-            uint32_t cs_original = ack_frame.header.checksum;
+            uint32_t cs_original = ntohl(ack_frame.header.checksum);
             ack_frame.header.checksum = 0;
             char check_buf[FRAME_SIZE];
             memcpy(check_buf, &ack_frame.header, HEADER_SIZE);
@@ -251,7 +251,7 @@ void *client_thread_func(void *arg) {
             }
 
             // update ack, base and timer
-            int ack = ack_frame.header.seq;
+            int ack = ntohs(ack_frame.header.seq);
             if ((ack - base + MAX_SEQ) % MAX_SEQ < WND_SIZE) {  // cumulativec ack
                 int num_acked = (ack - base + MAX_SEQ) % MAX_SEQ + 1;
                 data->rx_cnt += num_acked;

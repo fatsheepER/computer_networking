@@ -28,6 +28,7 @@ Please specify the group members here
 #include <asm-generic/errno-base.h>
 #include <asm-generic/errno.h>
 #include <asm-generic/socket.h>
+#include <bits/types/struct_timeval.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -73,6 +74,7 @@ typedef struct {
     uint32_t client_id;
 } client_thread_data_t;
 
+// Structure of a frame header
 typedef struct {
     uint32_t client_id;  // id for specific client
     uint16_t seq;  // sequence number
@@ -83,6 +85,7 @@ typedef struct {
     uint32_t checksum;  // crc-32c
 } header_t;
 
+// Structure of a frame
 typedef struct {
     header_t header;
     char payload[MESSAGE_SIZE];
@@ -92,6 +95,7 @@ typedef struct {
 #define FRAME_SIZE (HEADER_SIZE + MESSAGE_SIZE)
 #define WND_SIZE 64  
 #define MAX_SEQ 256  // enough for current window size
+#define TIMEOUT_US 20000LL  // 20 ms
 
 frame_t make_data_frame(int seq, uint32_t client_id) {
     frame_t frame;
@@ -108,12 +112,55 @@ frame_t make_data_frame(int seq, uint32_t client_id) {
     memcpy(frame.payload, "ABCDEFGHIJKLMNOP", 16);
 
     // calculate checksum
+    frame.header.checksum = 0;  // do the same in verification
     char buffer[FRAME_SIZE];
     memcpy(buffer, &frame.header, HEADER_SIZE);
     memcpy(buffer + HEADER_SIZE, frame.payload, MESSAGE_SIZE);
     frame.header.checksum = crc32c(buffer, FRAME_SIZE);
 
     return frame;
+}
+
+// send frame via udp socket
+void send_frame(int sock, frame_t *f) {
+    ssize_t sbytes = send(sock, f, FRAME_SIZE, 0);
+
+    if (sbytes == -1) {
+        perror("send_frame: send failed");
+    }
+    else if (sbytes != FRAME_SIZE) {
+        perror("send_frame: sent bytes mismatch");
+    }
+}
+
+// retransmit all frames within two SN from the ring-structured buffer
+// return how many frames has been sent
+int retransmit_window(int sock, frame_t *buf, int from_seq, int to_seq) {
+    int num_sent = 0;
+
+    for (int i = from_seq; i != to_seq; i = (i + 1) % MAX_SEQ) {
+        int idx = i % WND_SIZE;
+        send_frame(sock, &buf[idx]);    
+        num_sent++;
+    }
+
+    return num_sent;
+}
+
+inline void start_timer(long long *time_us) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    *time_us = now.tv_sec * 1000000LL + now.tv_usec;
+}
+
+inline long long time_until_timeout_us(long long time_us) {
+    if (time_us < 0) return -1LL;  // not started yet
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long long elapse = now.tv_sec * 1000000LL + now.tv_usec - time_us;
+
+    return (elapse >= TIMEOUT_US) ? 0 : (TIMEOUT_US - elapse);
 }
 
 /*
@@ -123,7 +170,6 @@ void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
     struct epoll_event event;  // to register interested event in epoll_ctl
     struct epoll_event events[MAX_EVENTS];  // records after epoll_wait
-    char send_buf[MESSAGE_SIZE] = "ABCDEFGHIJKMLNOP"; /* Send 16-Bytes message every time */
     char recv_buf[MESSAGE_SIZE];
     struct timeval start, end;
 
@@ -136,69 +182,91 @@ void *client_thread_func(void *arg) {
      */
     event.events = EPOLLIN;
     event.data.fd = data->socket_fd;  // save some data, just for reference
-    // ask epoll instance to watch this fd for interested events
+    // ask epoll instance to watch this socket_fd for interested events
     if (epoll_ctl(data->epoll_fd, EPOLL_CTL_ADD, data->socket_fd, &event) == -1) {
         perror("epoll_ctl");
         pthread_exit(NULL);
     }
 
-    uint32_t client_id = data->client_id;
-    int total_sent = 0;
+    int total_sent = 0;  //! can be replaced by tx_cnt
     int base = 0;  // the first sent-and-unacked seq
     int next_seq = 0;  // next seq to send
+    frame_t send_buf[WND_SIZE];
+    long long time_start_us = -1;  // -1: not started yet
+
+    uint32_t client_id = data->client_id;
 
     while (total_sent < num_requests) {
         // fill the window
-        while (next_seq < base + WND_SIZE && total_sent < num_requests) {
+        while ((next_seq - base + MAX_SEQ) % MAX_SEQ < WND_SIZE && total_sent < num_requests) {
             frame_t f = make_data_frame(next_seq, client_id);
+            send_frame(data->socket_fd, &f);
+
+            send_buf[next_seq % WND_SIZE] = f;  // cache in buffer, used in retransmission
+            if (base == next_seq) start_timer(&time_start_us);
+
+            next_seq = (next_seq + 1) % MAX_SEQ;  // send next
+            total_sent++; data->tx_cnt++;
         }
-    }
- 
-    for (int i = 0; i < num_requests; i++) {
-        gettimeofday(&start, NULL);
 
-        ssize_t n = send(data->socket_fd, send_buf, MESSAGE_SIZE, 0);
-        if (n != MESSAGE_SIZE) {
-            perror("send");
-            break;
+        // calculate rest time
+        long long time_left_us = time_until_timeout_us(time_start_us);
+        int time_left_ms = (time_left_us < 0) ? -1 : (int)(time_left_us / 1000);
+
+        // wait for response
+        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, time_left_ms);
+        if (nfds == -1) { perror("epoll_wait"); break; }
+
+        // Timeout: retransmit all within window
+        if (nfds == 0) {
+            int num_resent = retransmit_window(data->socket_fd, send_buf, base, next_seq);
+            // as asked to, no need to update tx_cnt after retransmission. anyway, it's accessible if needed
+            start_timer(&time_start_us);
+            continue;
         }
-        data->tx_cnt++;
 
-        // after wait, have [nfds] events ready
-        int nfds = epoll_wait(data->epoll_fd, events, MAX_EVENTS, 20);  //? this timeout parameter
-        if (nfds == -1) {
-            perror("epoll_wait");
-            break;
-        }
-        if (nfds == 0) { continue; }  // timeout and packet lost
+        // Receive: process acks
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd != data->socket_fd) continue;
 
-        // handle each of them
-        for (int j = 0; j < nfds; j++) {
-            if (events[j].data.fd != data->socket_fd) continue;  // retreive that data and identify
+            // is it complete
+            frame_t ack_frame;
+            ssize_t rbytes = recv(data->socket_fd, &ack_frame, FRAME_SIZE, MSG_WAITALL);
+            if (rbytes != FRAME_SIZE) { perror("recv"); break; }
 
-            ssize_t bytes = recv(data->socket_fd, recv_buf, MESSAGE_SIZE, MSG_WAITALL);  // WAITALL no need for udp?
-            if (bytes != MESSAGE_SIZE) {
-                perror("recv");
-                break;
+            // is it an ack
+            if (ack_frame.header.flags != 0) continue;
+
+            // check checksum
+            uint32_t cs_original = ack_frame.header.checksum;
+            ack_frame.header.checksum = 0;
+            char check_buf[FRAME_SIZE];
+            memcpy(check_buf, &ack_frame.header, HEADER_SIZE);
+            memcpy(check_buf + HEADER_SIZE, ack_frame.payload, MESSAGE_SIZE);
+
+            uint32_t cs_result = crc32c(check_buf, FRAME_SIZE);
+            if (cs_result != cs_original) { 
+                fprintf(stderr, "checksum mismatch!\n");
+                continue;
             }
-            data->rx_cnt++;  // packet received successfully
 
-            gettimeofday(&end, NULL);
-            long long rtt = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_usec - start.tv_usec);
-            data->total_rtt += rtt;
-            data->total_messages += 1;
+            // update ack, base and timer
+            int ack = ack_frame.header.seq;
+            if ((ack - base + MAX_SEQ) % MAX_SEQ < WND_SIZE) {  // cumulativec ack
+                int num_acked = (ack - base + MAX_SEQ) % MAX_SEQ + 1;
+                data->rx_cnt += num_acked;
+
+                base = (ack + 1) % MAX_SEQ;  // first unacked
+                if (base == next_seq) time_start_us = -1;  // window's empty, stop the timer
+                else start_timer(&time_start_us);  // restart the timer
+            }
         }
     }
 
-    /* TODO:
-     * The function exits after sending and receiving a predefined number of messages (num_requests). 
-     * It calculates the request rate based on total messages and RTT
-     */
-    if (data->total_rtt > 0) {
-        data->request_rate = (float)data->total_messages / (data->total_rtt / 1000000.0f);
-    }
+    // do some summary
     data->lost_pkt_cnt = data->tx_cnt - data->rx_cnt;
 
+    // close and wave goodbye
     close(data->socket_fd);
     close(data->epoll_fd);
 

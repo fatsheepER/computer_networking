@@ -98,6 +98,22 @@ typedef struct {
 #define MAX_SEQ 256  // enough for current window size
 #define TIMEOUT_US 20000LL  // 20 ms
 
+void start_timer(long long *time_us) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    *time_us = now.tv_sec * 1000000LL + now.tv_usec;
+}
+
+long long time_until_timeout_us(long long time_us) {
+    if (time_us < 0) return -1LL;  // not started yet
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long long elapse = now.tv_sec * 1000000LL + now.tv_usec - time_us;
+
+    return (elapse >= TIMEOUT_US) ? 0 : (TIMEOUT_US - elapse);
+}
+
 frame_t make_data_frame(uint16_t seq, uint32_t client_id) {
     frame_t frame;
 
@@ -123,6 +139,8 @@ frame_t make_data_frame(uint16_t seq, uint32_t client_id) {
 // send frame via udp socket
 void send_frame(int sock, frame_t *f) {
     ssize_t sbytes = send(sock, f, FRAME_SIZE, 0);
+    // uint16_t seq = ntohs(f->header.seq);
+    // printf("client sends %d.\n", seq);
 
     if (sbytes == -1) {
         perror("send_frame: send failed");
@@ -144,22 +162,6 @@ int retransmit_window(int sock, frame_t *buf, int from_seq, int to_seq) {
     }
 
     return num_sent;
-}
-
-inline void start_timer(long long *time_us) {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    *time_us = now.tv_sec * 1000000LL + now.tv_usec;
-}
-
-inline long long time_until_timeout_us(long long time_us) {
-    if (time_us < 0) return -1LL;  // not started yet
-
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    long long elapse = now.tv_sec * 1000000LL + now.tv_usec - time_us;
-
-    return (elapse >= TIMEOUT_US) ? 0 : (TIMEOUT_US - elapse);
 }
 
 /*
@@ -195,7 +197,7 @@ void *client_thread_func(void *arg) {
 
     uint32_t client_id = data->client_id;
 
-    while (total_sent < num_requests) {
+    while (total_sent < num_requests || base != next_seq) {
         // fill the window
         while ((next_seq - base + MAX_SEQ) % MAX_SEQ < WND_SIZE && total_sent < num_requests) {
             frame_t f = make_data_frame(next_seq, client_id);
@@ -206,6 +208,7 @@ void *client_thread_func(void *arg) {
 
             next_seq = (next_seq + 1) % MAX_SEQ;  // send next
             total_sent++; data->tx_cnt++;
+            // printf("client %d has sent %d\n", client_id, total_sent);
         }
 
         // calculate rest time
@@ -413,7 +416,7 @@ void run_server() {
     }
 
     // reduce socket buffer, might help observing packet loss
-    int rcv_buf_size = 2048;
+    int rcv_buf_size = 4096 * 16;
     if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size)) == -1) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
@@ -444,8 +447,6 @@ void run_server() {
         perror("epoll_ctl");
         exit(EXIT_FAILURE);
     }
-
-    crc32c_init(); // init crc32c table
 
     frame_t rcv_frame;
 
@@ -520,6 +521,8 @@ void run_server() {
 }
 
 int main(int argc, char *argv[]) {
+    crc32c_init(); // init crc32c table
+
     if (argc > 1 && strcmp(argv[1], "server") == 0) {
         if (argc > 2) server_ip = argv[2];
         if (argc > 3) server_port = atoi(argv[3]);

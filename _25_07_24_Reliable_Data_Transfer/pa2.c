@@ -69,6 +69,7 @@ typedef struct {
     // for packet loss measurement
     long tx_cnt;  // number of packets sent by each client thread
     long rx_cnt;  // number of returned packets successfully received by the client thread
+    long rt_cnt;  // number of retransmitted packets
     long lost_pkt_cnt;
 
     // for rdt
@@ -226,9 +227,10 @@ void *client_thread_func(void *arg) {
                 time_start_us = -1;
                 continue;
             }
+            // as asked to, no need to update tx_cnt after retransmission.
+            // anyway, I'd like to see how many frames are retransmitted.
+            data->rt_cnt +=  retransmit_window(data->socket_fd, send_buf, base, next_seq);
 
-            int num_resent = retransmit_window(data->socket_fd, send_buf, base, next_seq);
-            // as asked to, no need to update tx_cnt after retransmission. anyway, it's accessible if needed
             start_timer(&time_start_us);
             continue;
         }
@@ -331,6 +333,7 @@ void run_client() {
             .request_rate = 0.0f,
             .tx_cnt = 0,
             .rx_cnt = 0,
+            .rt_cnt = 0,
             .client_id = (uint32_t)i  // allocate id for each client
         };
 
@@ -343,17 +346,20 @@ void run_client() {
      */
     long total_tx_cnt = 0;
     long total_rx_cnt = 0;
+    long total_rt_cnt = 0;
     long total_lost_pkts = 0;
 
     for (int i = 0; i < num_client_threads; i++) {
         pthread_join(threads[i], NULL);
         total_tx_cnt += thread_data[i].tx_cnt;
         total_rx_cnt += thread_data[i].rx_cnt;
+        total_rt_cnt += thread_data[i].rt_cnt;
         total_lost_pkts += thread_data[i].lost_pkt_cnt;
     }
 
     printf("Total tx_cnt: %ld messages\n", total_tx_cnt);
     printf("Total rx_cnt: %ld messages\n", total_rx_cnt);
+    printf("Total rt_cnt: %ld messages\n", total_rt_cnt);
     printf("Total Packet Loss: %ld messages\n", total_lost_pkts);
 }
 

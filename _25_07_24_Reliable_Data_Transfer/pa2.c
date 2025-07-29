@@ -241,7 +241,7 @@ void run_server() {
     }
 
     // reduce socket buffer, might help observing packet loss
-    int rcv_buf_size = 2048;
+    int rcv_buf_size = 4096 * 16;
     if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv_buf_size, sizeof(rcv_buf_size)) == -1) {
         perror("setsockopt");
         exit(EXIT_FAILURE);
